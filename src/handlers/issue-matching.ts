@@ -8,6 +8,9 @@ export interface IssueGraphqlResponse {
     state: string;
     stateReason: string;
     closed: boolean;
+    createdAt?: string | null;
+    updatedAt?: string | null;
+    closedAt?: string | null;
     repository: {
       owner: {
         login: string;
@@ -24,6 +27,13 @@ export interface IssueGraphqlResponse {
   similarity: number;
 }
 
+type RepositoryContext = {
+  owner: {
+    login: string;
+  };
+  name: string;
+};
+
 type IssueNodeResponse = IssueGraphqlResponse | { node: null };
 
 type IssueCommentSummary = {
@@ -31,8 +41,73 @@ type IssueCommentSummary = {
   body?: string | null;
 };
 
+const SAME_REPOSITORY_MULTIPLIER = 1;
+const SAME_ORGANIZATION_MULTIPLIER = 0.75;
+const GLOBAL_MULTIPLIER = 0.5;
+const MAX_RECENCY_AGE_DAYS = 365 * 2;
+
 function hasIssueNode(response: IssueNodeResponse): response is IssueGraphqlResponse {
   return response.node !== null;
+}
+
+function clampScore(score: number): number {
+  return Math.max(0, Math.min(1, score));
+}
+
+function getRepositoryContextMultiplier(issue: IssueGraphqlResponse, repository: RepositoryContext) {
+  const isSameOwner = issue.node.repository.owner.login === repository.owner.login;
+  const isSameRepository = isSameOwner && issue.node.repository.name === repository.name;
+
+  if (isSameRepository) {
+    return SAME_REPOSITORY_MULTIPLIER;
+  }
+  if (isSameOwner) {
+    return SAME_ORGANIZATION_MULTIPLIER;
+  }
+  return GLOBAL_MULTIPLIER;
+}
+
+function getRecencyMultiplier(issue: IssueGraphqlResponse) {
+  const timestamp = issue.node.closedAt ?? issue.node.updatedAt ?? issue.node.createdAt;
+  if (!timestamp) {
+    return 1;
+  }
+
+  const updatedAt = new Date(timestamp).getTime();
+  if (Number.isNaN(updatedAt)) {
+    return 1;
+  }
+
+  const ageDays = Math.max(0, (Date.now() - updatedAt) / (24 * 60 * 60 * 1000));
+  return Math.max(0.5, 1 - ageDays / MAX_RECENCY_AGE_DAYS);
+}
+
+function getCompletionMultiplier(issue: IssueGraphqlResponse) {
+  if (issue.node.closed && issue.node.stateReason === "COMPLETED") {
+    return 1;
+  }
+  if (issue.node.closed) {
+    return 0.75;
+  }
+  return 0.6;
+}
+
+function getAssignmentQualityMultiplier(issue: IssueGraphqlResponse) {
+  const assigneeCount = issue.node.assignees.nodes.length;
+  if (assigneeCount <= 1) {
+    return 1;
+  }
+  return Math.max(0.85, 1 - (assigneeCount - 1) * 0.05);
+}
+
+function calculateRecommendationScore(issue: IssueGraphqlResponse, repository: RepositoryContext) {
+  return clampScore(
+    issue.similarity *
+      getRepositoryContextMultiplier(issue, repository) *
+      getRecencyMultiplier(issue) *
+      getCompletionMultiplier(issue) *
+      getAssignmentQualityMultiplier(issue)
+  );
 }
 
 export async function issueMatchingWithComment(context: Context<"issues.opened" | "issues.edited" | "issues.labeled">) {
@@ -149,10 +224,11 @@ async function issueMatchingInternal(context: Context<IssueMatchingEvents>, opti
   // If alwaysRecommend is enabled, use a lower threshold to ensure we get enough recommendations
   const threshold =
     options.forceThresholdZero || (context.config.alwaysRecommend && context.config.alwaysRecommend > 0) ? 0 : context.config.jobMatchingThreshold;
+  const searchThreshold = threshold > 0 ? threshold * GLOBAL_MULTIPLIER : threshold;
 
   const similarIssues = await supabase.issue.findSimilarIssuesToMatch({
     markdown: issueContent,
-    threshold: threshold,
+    threshold: searchThreshold,
     currentId: issue.node_id,
     topK: options.topK,
   });
@@ -178,6 +254,9 @@ async function issueMatchingInternal(context: Context<IssueMatchingEvents>, opti
                   }
                   stateReason
                   closed
+                  createdAt
+                  updatedAt
+                  closedAt
                   assignees(first: 10) {
                     nodes {
                       login
@@ -204,6 +283,7 @@ async function issueMatchingInternal(context: Context<IssueMatchingEvents>, opti
     const issueList = await Promise.allSettled(fetchPromises);
 
     logger.debug("Fetched similar issues", { issueList });
+    const contributorScores: Map<string, number[]> = new Map();
     issueList.forEach((issuePromise: PromiseSettledResult<IssueGraphqlResponse | null>) => {
       if (!issuePromise || issuePromise.status === "rejected" || !issuePromise.value) {
         return;
@@ -219,8 +299,11 @@ async function issueMatchingInternal(context: Context<IssueMatchingEvents>, opti
           if (options.allowedLogins && !options.allowedLogins.has(assignee.login)) {
             return;
           }
-          const similarityPercentage = Math.round(issue.similarity * 100);
+          const similarityPercentage = Math.round(calculateRecommendationScore(issue, payload.repository) * 100);
           const issueLink = issue.node.url.replace(/https?:\/\/github.com/, "https://www.github.com");
+          const scores = contributorScores.get(assignee.login) ?? [];
+          scores.push(similarityPercentage);
+          contributorScores.set(assignee.login, scores);
           if (matchResultArray.has(assignee.login)) {
             matchResultArray
               .get(assignee.login)
@@ -251,9 +334,9 @@ async function issueMatchingInternal(context: Context<IssueMatchingEvents>, opti
       .map(([login, matches]) => ({
         login,
         matches,
-        maxSimilarity: matches.length ? Math.max(...matches.map((match) => parseInt(match.match(/`(\d+)% Match`/)?.[1] || "0"))) : 0,
+        maxSimilarity: contributorScores.get(login)?.length ? Math.max(...(contributorScores.get(login) ?? [])) : 0,
       }))
-      .sort((a, b) => b.maxSimilarity - a.maxSimilarity);
+      .sort((a, b) => b.maxSimilarity - a.maxSimilarity || b.matches.length - a.matches.length);
 
     logger.debug("Sorted contributors", { sortedContributors });
     return { matchResultArray, similarIssues, sortedContributors };
